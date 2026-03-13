@@ -208,9 +208,15 @@ local function trigger(v, amp)
   if midi_out then
     local vel = math.floor(util.clamp(amp, 0, 1) * 127)
     midi_out:note_on(voice_midi[v], vel, MIDI_CH)
+    -- Note: clock.run spawns a clock thread for note-off. Multiple triggers
+    -- across different voices can accumulate clock threads. For now, this is
+    -- acceptable for the use case, but long-term could be optimized with a
+    -- single metro or reusable thread pool.
     clock.run(function()
       clock.sleep(0.05)
-      midi_out:note_off(voice_midi[v], 0, MIDI_CH)
+      if midi_out then
+        midi_out:note_off(voice_midi[v], 0, MIDI_CH)
+      end
     end)
   end
 end
@@ -501,4 +507,10 @@ end
 
 function cleanup()
   if clk_id then clock.cancel(clk_id) end
+  if midi_out then
+    for v = 1, VOICES do
+      midi_out:cc(123, 0, MIDI_CH)  -- all notes off for this channel
+    end
+  end
+  clock.cancel_all()
 end
