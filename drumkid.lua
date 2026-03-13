@@ -20,6 +20,7 @@ local BPM_MIN = 40
 local BPM_MAX = 300
 
 local voice_names  = { "kick", "snare", "hat", "open" }
+local voice_abbr   = { "BD", "SD", "HH", "PC" }
 local voice_colors = { 15, 10, 6, 4 }
 
 local sample_paths = {
@@ -75,6 +76,14 @@ local playing = false
 local clk_id  = nil
 local k3_hold_id = nil
 local K3_LONG    = 0.6
+
+-- Screen state
+local beat_phase = 0
+local popup_param = nil
+local popup_val = nil
+local popup_time = 0
+local POPUP_DURATION = 0.8
+local screen_refresh_rate = 10  -- ~10fps
 
 -- ─── pattern ─────────────────────────────────────────────────────────────────
 
@@ -317,7 +326,7 @@ local function tick()
   end
   
   grid_redraw()
-  redraw()
+  beat_phase = beat_phase + 1
 end
 
 -- subdiv counter for half/double time
@@ -376,7 +385,7 @@ g.key = function(x, y, z)
   if y >= 1 and y <= VOICES and x >= 1 and x <= STEPS and z == 1 then
     pattern[y][x] = not pattern[y][x]
     grid_redraw()
-    redraw()
+    beat_phase = beat_phase + 1
   end
 end
 
@@ -400,7 +409,7 @@ function key(n, z)
         k2_hold_id = nil
         playing = not playing
         if playing then step = 1 end
-        redraw()
+        beat_phase = beat_phase + 1
       end
     end
   elseif n == 3 then
@@ -412,7 +421,10 @@ function key(n, z)
           k2_hold_id = nil
         end
         randomise_single(all_params[param_idx])
-        redraw()
+        popup_param = all_params[param_idx]
+        popup_val = p_vals[popup_param]
+        popup_time = POPUP_DURATION
+        beat_phase = beat_phase + 1
       else
         -- start K3 hold timer
         k3_hold_id = clock.run(function()
@@ -420,7 +432,7 @@ function key(n, z)
           randomise_params()
           randomise_pattern()
           k3_hold_id = nil
-          redraw()
+          beat_phase = beat_phase + 1
           grid_redraw()
         end)
       end
@@ -430,7 +442,7 @@ function key(n, z)
         clock.cancel(k3_hold_id)
         k3_hold_id = nil
         randomise_pattern()
-        redraw()
+        beat_phase = beat_phase + 1
         grid_redraw()
       end
     end
@@ -440,62 +452,182 @@ end
 function enc(n, d)
   if n == 1 then
     set_bpm(bpm + d)
+    popup_param = "BPM"
+    popup_val = bpm
+    popup_time = POPUP_DURATION
   elseif n == 2 then
     param_idx = util.clamp(param_idx + d, 1, #all_params)
   elseif n == 3 then
     local k = all_params[param_idx]
     p_vals[k] = util.clamp(p_vals[k] + d * 0.01, 0.0, 1.0)
+    popup_param = k
+    popup_val = p_vals[k]
+    popup_time = POPUP_DURATION
   end
-  redraw()
+  beat_phase = beat_phase + 1
 end
 
-function redraw()
-  screen.clear()
+-- ─── screen redesign: zone-based layout ───────────────────────────────────────
 
-  -- header
-  screen.level(15)
+local function draw_status_strip()
+  -- STATUS STRIP (y 0-8)
+  screen.level(4)
   screen.font_size(8)
-  screen.move(2, 8)
-  screen.text("drumkid")
-  screen.level(playing and 15 or 4)
-  screen.move(58, 8)
-  screen.text((playing and ">" or "|") .. " " .. bpm .. " bpm")
-
-  -- chain indicator
-  if chain_active then
-    screen.level(12)
-    screen.move(2, 62)
-    screen.text("CHAIN:" .. chain_pos .. "/" .. #chain)
+  screen.move(2, 7)
+  screen.text("DRUMKID")
+  
+  -- Current pattern chain position (right side)
+  if chain_active and #chain > 0 then
+    local chain_str = ""
+    for i = 1, #chain do
+      if i == chain_pos then
+        screen.level(10)
+        chain_str = chain_str .. (string.char(64 + i))  -- A, B, C, ...
+      else
+        screen.level(6)
+        chain_str = chain_str .. (string.char(64 + i))
+      end
+    end
+    screen.level(6)
+    screen.move(90, 7)
+    screen.text(chain_str)
   end
+  
+  -- Beat pulse dot (playhead indicator)
+  if playing then
+    screen.level(15)
+    screen.circle(124, 4, 1)
+    screen.fill()
+  end
+end
 
-  -- step grid
-  local gx, gy = 2, 14
-  local sw, sh = 7, 5
+local function draw_live_zone()
+  -- LIVE ZONE (y 9-52): TR-style grid
+  local grid_x = 2
+  local grid_y = 10
+  local cell_w = 7
+  local cell_h = 8
+  local cell_gap = 1
+  
+  -- Voice labels on the left
+  for v = 1, VOICES do
+    screen.level(5)
+    screen.font_size(8)
+    screen.move(grid_x - 8, grid_y + (v - 1) * (cell_h + cell_gap) + cell_h - 1)
+    screen.text(voice_abbr[v])
+  end
+  
+  -- Grid cells
   for v = 1, VOICES do
     for s = 1, STEPS do
-      local x = gx + (s - 1) * (sw + 1)
-      local y = gy + (v - 1) * (sh + 2)
-      if s == step and playing then
-        screen.level(15)
-        screen.rect(x, y, sw, sh)
-        screen.fill()
-      elseif pattern[v][s] then
-        screen.level(voice_colors[v])
-        screen.rect(x, y, sw, sh)
+      local x = grid_x + (s - 1) * (cell_w + cell_gap)
+      local y = grid_y + (v - 1) * (cell_h + cell_gap)
+      local hit = pattern[v][s]
+      local is_playhead = (s == step and playing)
+      
+      local brightness = 1  -- faint grid default
+      if hit then
+        brightness = 12  -- full brightness for hit
+      else
+        -- Probability-based brightness: if we can infer a prob value
+        -- For now, use static prob; could be per-step in future
+        local prob_factor = voice_prob[v] / 100
+        if prob_factor < 1.0 then
+          brightness = math.floor(4 + prob_factor * 8)
+        else
+          brightness = 4  -- dim for non-hit grid
+        end
+      end
+      
+      -- Playhead boost
+      if is_playhead then
+        brightness = math.min(15, brightness + 3)
+      end
+      
+      screen.level(brightness)
+      screen.rect(x, y, cell_w, cell_h)
+      if brightness >= 10 then
         screen.fill()
       else
-        screen.level(2)
-        screen.rect(x, y, sw, sh)
         screen.stroke()
       end
     end
-    screen.level(voice_colors[v])
-    screen.move(gx + STEPS * (sw + 1) + 1, gy + (v - 1) * (sh + 2) + sh)
-    screen.text(voice_names[v] .. " P:" .. voice_prob[v])
   end
+end
 
-  -- param display: 4 visible at a time, window follows selection
-  local py      = 50
+local function draw_chain_preview()
+  -- PATTERN CHAIN PREVIEW (below grid)
+  if chain_active and #chain > 1 then
+    screen.level(4)
+    screen.font_size(8)
+    screen.move(2, 53)
+    local current = string.char(64 + chain_pos)  -- current pattern letter
+    local next_pos = (chain_pos % #chain) + 1
+    local next_chr = string.char(64 + next_pos)
+    screen.text(current)
+    screen.level(10)
+    screen.move(12, 53)
+    screen.text(">" .. next_chr)
+  end
+end
+
+local function draw_context_bar()
+  -- CONTEXT BAR (y 53-58)
+  local y = 54
+  screen.font_size(7)
+  
+  -- BPM
+  screen.level(8)
+  screen.move(2, y + 6)
+  screen.text(string.format("BPM:%d", bpm))
+  
+  -- Swing %
+  screen.level(6)
+  screen.move(35, y + 6)
+  screen.text(string.format("SW:%.0f%%", p_vals.swing * 100))
+  
+  -- Zoom level
+  screen.level(5)
+  screen.move(65, y + 6)
+  screen.text(string.format("Z:%.1f", p_vals.zoom))
+  
+  -- MIDI channel
+  screen.level(4)
+  screen.move(95, y + 6)
+  screen.text("CH:" .. MIDI_CH)
+end
+
+local function draw_transient_popup()
+  -- TRANSIENT PARAMETER POPUP (0.8s duration)
+  if popup_time > 0 then
+    popup_time = popup_time - (1 / screen_refresh_rate)
+    
+    -- Semi-transparent background
+    screen.level(2)
+    screen.rect(40, 25, 48, 20)
+    screen.fill()
+    
+    -- Border
+    screen.level(15)
+    screen.rect(40, 25, 48, 20)
+    screen.stroke()
+    
+    -- Parameter name
+    screen.level(15)
+    screen.font_size(8)
+    screen.move(44, 33)
+    screen.text(popup_param)
+    
+    -- Value display
+    screen.level(12)
+    screen.move(44, 41)
+    screen.text(string.format("%.3f", popup_val))
+  end
+end
+
+local function draw_param_strip()
+  -- Parameter display: 4 visible at a time, window follows selection
+  local py      = 46
   local page    = math.floor((param_idx - 1) / 4)
   local start_i = page * 4 + 1
   local n_pages = math.ceil(#all_params / 4)
@@ -507,6 +639,7 @@ function redraw()
     local col = (i - start_i)
     local x   = 2 + col * 31
     screen.level(sel and 15 or 5)
+    screen.font_size(8)
     screen.move(x, py)
     screen.text(k:sub(1, 4))
     screen.level(sel and 12 or 3)
@@ -528,12 +661,36 @@ function redraw()
     screen.rect(116 + p * 6, py, 4, 4)
     screen.fill()
   end
+end
 
+local function draw_help_footer()
+  -- Help text footer
   screen.level(3)
+  screen.font_size(7)
   screen.move(2, 64)
   screen.text("e3:adj k3:pat k2+k3:rnd1 k3L:all")
+end
 
+function redraw()
+  screen.clear()
+  
+  draw_status_strip()
+  draw_live_zone()
+  draw_chain_preview()
+  draw_context_bar()
+  draw_param_strip()
+  draw_transient_popup()
+  draw_help_footer()
+  
   screen.update()
+end
+
+-- Screen refresh clock (~10 fps)
+local function screen_refresh_loop()
+  while true do
+    clock.sleep(1 / screen_refresh_rate)
+    redraw()
+  end
 end
 
 -- ─── init ────────────────────────────────────────────────────────────────────
@@ -552,6 +709,7 @@ function init()
     print("drumkid: ready")
   end)
   clk_id = clock.run(clock_loop)
+  clock.run(screen_refresh_loop)
   redraw()
   grid_redraw()
 end
