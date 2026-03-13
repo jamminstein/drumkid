@@ -8,6 +8,8 @@
 -- K2: play / stop
 -- K3 short: randomise selected param
 -- K3 long:  randomise all params
+-- K1+K2: save current pattern to chain
+-- K1+K3: toggle chain mode
 -- grid (optional): toggle steps
 
 engine.name = 'None'
@@ -48,8 +50,18 @@ local p_vals = {
   velocity = 0.0,
   subdiv   = 0.5,  -- 0=half time, 0.5=normal, 1=double time
   reverb   = 0.0,  -- 0=dry, 1=full reverb send
-  warmth   = 0.0,  -- 0=bright/clean, 1=warm/filtered/saturated  -- 0=fixed velocity, 1=maximum random variation
+  warmth   = 0.0,  -- 0=bright/clean, 1=warm/filtered/saturated
 }
+
+-- Per-voice probability table
+local voice_prob = { 100, 100, 100, 100 }
+
+-- Pattern chain: store up to 8 patterns
+local chain = {}
+local chain_pos = 0
+local chain_active = false
+local chain_bars = 0
+local chain_bars_per_pattern = 4
 
 -- MIDI output
 local midi_out   = nil
@@ -126,6 +138,29 @@ local function randomise_params()
   end
 end
 
+-- ─── pattern chain ───────────────────────────────────────────────────────────
+
+local function save_pattern_to_chain()
+  local new_entry = {}
+  for v = 1, VOICES do
+    new_entry[v] = {}
+    for s = 1, STEPS do
+      new_entry[v][s] = pattern[v][s]
+    end
+  end
+  table.insert(chain, new_entry)
+  print("Pattern saved to chain (position " .. #chain .. ")")
+end
+
+local function load_chain_pattern(pos)
+  if pos < 1 or pos > #chain then return end
+  for v = 1, VOICES do
+    for s = 1, STEPS do
+      pattern[v][s] = chain[pos][v][s]
+    end
+  end
+end
+
 -- ─── softcut ─────────────────────────────────────────────────────────────────
 
 local function init_softcut()
@@ -156,6 +191,9 @@ end
 
 local function trigger(v, amp)
   if amp <= 0 then return end
+
+  -- Per-voice probability gate
+  if math.random(100) > voice_prob[v] then return end
 
   -- velocity randomisation
   if p_vals.velocity > 0 then
@@ -208,10 +246,6 @@ local function trigger(v, amp)
   if midi_out then
     local vel = math.floor(util.clamp(amp, 0, 1) * 127)
     midi_out:note_on(voice_midi[v], vel, MIDI_CH)
-    -- Note: clock.run spawns a clock thread for note-off. Multiple triggers
-    -- across different voices can accumulate clock threads. For now, this is
-    -- acceptable for the use case, but long-term could be optimized with a
-    -- single metro or reusable thread pool.
     clock.run(function()
       clock.sleep(0.05)
       if midi_out then
@@ -271,6 +305,17 @@ local function tick()
   end
 
   step = (step % STEPS) + 1
+  
+  -- Handle chain advancement
+  if chain_active and #chain > 0 then
+    chain_bars = chain_bars + 1
+    if chain_bars >= chain_bars_per_pattern then
+      chain_bars = 0
+      chain_pos = (chain_pos % #chain) + 1
+      load_chain_pattern(chain_pos)
+    end
+  end
+  
   grid_redraw()
   redraw()
 end
@@ -362,7 +407,6 @@ function key(n, z)
     if z == 1 then
       if k2_down then
         -- K2+K3: cancel K2 transport action, randomise selected param
-        -- keep k2_down = true so repeated K3 presses keep randomising
         if k2_hold_id then
           clock.cancel(k2_hold_id)
           k2_hold_id = nil
@@ -417,6 +461,13 @@ function redraw()
   screen.move(58, 8)
   screen.text((playing and ">" or "|") .. " " .. bpm .. " bpm")
 
+  -- chain indicator
+  if chain_active then
+    screen.level(12)
+    screen.move(2, 62)
+    screen.text("CHAIN:" .. chain_pos .. "/" .. #chain)
+  end
+
   -- step grid
   local gx, gy = 2, 14
   local sw, sh = 7, 5
@@ -440,7 +491,7 @@ function redraw()
     end
     screen.level(voice_colors[v])
     screen.move(gx + STEPS * (sw + 1) + 1, gy + (v - 1) * (sh + 2) + sh)
-    screen.text(voice_names[v])
+    screen.text(voice_names[v] .. " P:" .. voice_prob[v])
   end
 
   -- param display: 4 visible at a time, window follows selection
