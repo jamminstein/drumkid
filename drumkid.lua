@@ -85,6 +85,9 @@ local popup_time = 0
 local POPUP_DURATION = 0.8
 local screen_refresh_rate = 10  -- ~10fps
 
+-- Clock IDs for cleanup
+local screen_refresh_id = nil
+
 -- ─── pattern ─────────────────────────────────────────────────────────────────
 
 local pattern = {}
@@ -709,13 +712,14 @@ function init()
     print("drumkid: ready")
   end)
   clk_id = clock.run(clock_loop)
-  clock.run(screen_refresh_loop)
+  screen_refresh_id = clock.run(screen_refresh_loop)
   redraw()
   grid_redraw()
 end
 
 function cleanup()
   if clk_id then clock.cancel(clk_id) end
+  if screen_refresh_id then clock.cancel(screen_refresh_id) end
   if midi_out then
     for v = 1, VOICES do
       midi_out:cc(123, 0, MIDI_CH)  -- all notes off for this channel
