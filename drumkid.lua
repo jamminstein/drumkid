@@ -32,7 +32,7 @@ local SLOT   = 1.0
 local sc_buf = { 1, 1, 2, 2 }
 local sc_pos = { 0.0, SLOT, 0.0, SLOT }
 
-local all_params = { "chance","zoom","midpoint","range","pitch","crush","crop","drop","velocity","subdiv","reverb","warmth" }
+local all_params = { "chance","zoom","midpoint","range","pitch","crush","crop","drop","velocity","subdiv","reverb","warmth","prob_amt","swing","midi_ch_k","midi_ch_s","midi_ch_h" }
 local param_idx  = 1
 
 local p_vals = {
@@ -40,11 +40,31 @@ local p_vals = {
   pitch=0.5, crush=1.0, crop=1.0, drop=0.5,
   swing=0.0, velocity=0.0, subdiv=0.5,
   reverb=0.0, warmth=0.0,
+  prob_amt=1.0, swing=0.0, midi_ch_k=10, midi_ch_s=10, midi_ch_h=10,
 }
 
+-- Per-hit probability table: probability[voice][step]
+local probability = {}
+for v = 1, VOICES do
+  probability[v] = {}
+  for s = 1, STEPS do probability[v][s] = 1.0 end
+end
+
+-- Fill state tracking
+local fill_active = false
+local fill_counter = 0
+local fill_duration = 4  -- ticks in a 16th note pattern (4 ticks = 1 bar at default subdiv)
+
 local midi_out   = nil
-local MIDI_CH    = 10
 local voice_midi = { 36, 38, 42, 46 }
+
+-- Get MIDI channel for voice (1-indexed voice, return 1-indexed channel)
+local function get_midi_channel(voice)
+  if voice == 1 then return math.floor(util.clamp(p_vals.midi_ch_k, 1, 16))
+  elseif voice == 2 then return math.floor(util.clamp(p_vals.midi_ch_s, 1, 16))
+  elseif voice == 3 then return math.floor(util.clamp(p_vals.midi_ch_h, 1, 16))
+  else return math.floor(util.clamp(p_vals.midi_ch_h, 1, 16)) end
+end
 
 local bpm     = 120
 local step    = 1
@@ -88,6 +108,9 @@ local function randomise_single(k)
     p_vals[k] = r<0.2 and math.random()*0.35 or r<0.4 and 0.65+math.random()*0.35 or 0.4+math.random()*0.2
   elseif k=="reverb" then p_vals[k] = math.random()*0.7
   elseif k=="warmth" then p_vals[k] = math.random()*0.8
+  elseif k=="prob_amt" then p_vals[k] = 0.5+math.random()*0.5
+  elseif k=="swing" then p_vals[k] = math.random()*0.5
+  elseif k=="midi_ch_k" or k=="midi_ch_s" or k=="midi_ch_h" then p_vals[k] = math.floor(math.random()*16)+1
   else p_vals[k] = math.random() end
 end
 
@@ -115,6 +138,10 @@ end
 
 local function trigger(v, amp)
   if amp <= 0 then return end
+  -- Apply fill humanization (50% increased density, 20% velocity boost)
+  if fill_active then
+    amp = amp * 1.2
+  end
   if p_vals.velocity > 0 then
     local variation = (math.random()*2-1)*p_vals.velocity*0.5
     amp = util.clamp(amp+variation, 0.05, 1.0)
@@ -147,8 +174,9 @@ local function trigger(v, amp)
   softcut.play(v,1)
   if midi_out then
     local vel = math.floor(util.clamp(amp,0,1)*127)
-    midi_out:note_on(voice_midi[v],vel,MIDI_CH)
-    clock.run(function() clock.sleep(0.05); midi_out:note_off(voice_midi[v],0,MIDI_CH) end)
+    local midi_ch = get_midi_channel(v)
+    midi_out:note_on(voice_midi[v],vel,midi_ch)
+    clock.run(function() clock.sleep(0.05); midi_out:note_off(voice_midi[v],0,midi_ch) end)
   end
 end
 
@@ -178,14 +206,27 @@ local function tick()
   for v = 1, VOICES do
     if not voice_dropped(v) then
       local fired = false
-      if pattern[v][step] then trigger(v,1.0); fired=true end
+      -- Check per-hit probability before triggering pattern note
+      if pattern[v][step] then
+        local prob = probability[v][step] * p_vals.prob_amt
+        if math.random() < prob then trigger(v,1.0); fired=true end
+      end
       if not fired and zsteps[step] then
         local low  = p_vals.midpoint-p_vals.range*0.5
         local high = p_vals.midpoint+p_vals.range*0.5
         local pos  = (step-1)/(STEPS-1)
-        if pos>=low and pos<=high and roll(p_vals.chance) then trigger(v,0.8) end
+        if pos>=low and pos<=high and roll(p_vals.chance) then
+          -- Also apply per-hit probability to chance hits
+          local prob = probability[v][step] * p_vals.prob_amt
+          if math.random() < prob then trigger(v,0.8) end
+        end
       end
     end
+  end
+  -- Decrement fill counter
+  if fill_active then
+    fill_counter = fill_counter - 1
+    if fill_counter <= 0 then fill_active = false end
   end
   step = (step%STEPS)+1
   grid_redraw(); redraw()
@@ -201,7 +242,16 @@ local function clock_loop()
         subdiv_counter = subdiv_counter+1
         if subdiv_counter >= 2 then subdiv_counter=0; tick() end
       elseif p_vals.subdiv > 0.6 then
-        tick(); clock.sleep(60/bpm/4/2); tick()
+        -- Swing humanization: delay even 16th notes
+        tick()
+        if p_vals.swing > 0 then
+          local beat_dur = 60/bpm/4  -- duration of a 16th note in seconds
+          local swing_delay = p_vals.swing * beat_dur / 2
+          clock.sleep(beat_dur/2 + swing_delay)
+        else
+          clock.sleep(60/bpm/4/2)
+        end
+        tick()
       else
         subdiv_counter=0; tick()
       end
@@ -270,6 +320,11 @@ function key(n, z)
       if k3_hold_id then
         clock.cancel(k3_hold_id); k3_hold_id=nil
         randomise_pattern(); redraw(); grid_redraw()
+      else
+        -- Short K3 press (not held): trigger fill
+        fill_active = true
+        fill_counter = 4  -- 1 bar fill (4 x 16th notes at default)
+        redraw()
       end
     end
   end
@@ -280,7 +335,12 @@ function enc(n, d)
   elseif n==2 then param_idx=util.clamp(param_idx+d,1,#all_params)
   elseif n==3 then
     local k = all_params[param_idx]
-    p_vals[k] = util.clamp(p_vals[k]+d*0.01, 0.0, 1.0)
+    -- Handle integer parameters (MIDI channels, 1-16)
+    if k=="midi_ch_k" or k=="midi_ch_s" or k=="midi_ch_h" then
+      p_vals[k] = util.clamp(p_vals[k]+d, 1, 16)
+    else
+      p_vals[k] = util.clamp(p_vals[k]+d*0.01, 0.0, 1.0)
+    end
   end
   redraw()
 end
@@ -289,7 +349,8 @@ function redraw()
   screen.clear()
   screen.level(15); screen.font_size(8); screen.move(2,8); screen.text("drumkid")
   screen.level(playing and 15 or 4)
-  screen.move(58,8); screen.text((playing and ">" or "|").." "..bpm.." bpm")
+  local fill_indicator = fill_active and " FILL" or ""
+  screen.move(58,8); screen.text((playing and ">" or "|").." "..bpm.." bpm"..fill_indicator)
   local gx,gy = 2,14
   local sw,sh = 7,5
   for v = 1, VOICES do
@@ -316,14 +377,21 @@ function redraw()
     local k=all_params[i]; local val=p_vals[k]; local sel=(i==param_idx)
     local col=(i-start_i); local x=2+col*31
     screen.level(sel and 15 or 5); screen.move(x,py); screen.text(k:sub(1,4))
-    screen.level(sel and 12 or 3); screen.rect(x,py+3,math.floor(val*28),3); screen.fill()
+    -- For integer MIDI channel params, display as 0-1 bar
+    if k=="midi_ch_k" or k=="midi_ch_s" or k=="midi_ch_h" then
+      local bar_width = math.floor((val/16)*28)
+      screen.level(sel and 12 or 3); screen.rect(x,py+3,bar_width,3); screen.fill()
+      if sel then screen.level(6); screen.move(x,py+13); screen.text(string.format("%d",val)) end
+    else
+      screen.level(sel and 12 or 3); screen.rect(x,py+3,math.floor(val*28),3); screen.fill()
+      if sel then screen.level(6); screen.move(x,py+13); screen.text(string.format("%.2f",val)) end
+    end
     screen.level(sel and 5 or 2); screen.rect(x,py+3,28,3); screen.stroke()
-    if sel then screen.level(6); screen.move(x,py+13); screen.text(string.format("%.2f",val)) end
   end
   for p = 0, n_pages-1 do
     screen.level(p==page and 12 or 4); screen.rect(116+p*6,py,4,4); screen.fill()
   end
-  screen.level(3); screen.move(2,64); screen.text("e3:adj k3:pat k2+k3:rnd")
+  screen.level(3); screen.move(2,64); screen.text("e3:adj k3:pat/fill k2+k3:rnd")
   screen.update()
 end
 
