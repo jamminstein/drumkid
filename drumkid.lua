@@ -675,5 +675,11 @@ function init()
 end
 
 function cleanup()
+  -- Send all-notes-off before cancelling clocks
+  if midi_out then
+    for ch = 1, 16 do
+      midi_out:cc(123, 0, ch)
+    end
+  end
   if clk_id then clock.cancel(clk_id) end
 end
