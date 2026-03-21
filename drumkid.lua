@@ -210,6 +210,11 @@ local fill_counter = 0
 local midi_out   = nil
 local voice_midi = { 36, 38, 42, 46 }
 
+-- OP-XY MIDI
+local opxy_out = nil
+local function opxy_note_on(note, vel) if opxy_out then opxy_out:note_on(note, vel, params:get("opxy_channel")) end end
+local function opxy_note_off(note) if opxy_out then opxy_out:note_off(note, 0, params:get("opxy_channel")) end end
+
 local function get_midi_channel(voice)
   if voice == 1 then return math.floor(util.clamp(p_vals.midi_ch_k, 1, 16))
   elseif voice == 2 then return math.floor(util.clamp(p_vals.midi_ch_s, 1, 16))
@@ -460,6 +465,15 @@ local function trigger(v, amp)
     clock.run(function()
       clock.sleep(0.05)
       midi_out:note_off(voice_midi[v], 0, midi_ch)
+    end)
+  end
+  -- OP-XY MIDI out
+  do
+    local vel = math.floor(util.clamp(amp, 0, 1) * 127)
+    opxy_note_on(voice_midi[v], vel)
+    clock.run(function()
+      clock.sleep(0.05)
+      opxy_note_off(voice_midi[v])
     end)
   end
 end
@@ -848,6 +862,11 @@ function init()
   set_bpm(bpm)
   midi_out = midi.connect(1)
 
+  params:add_separator("OP-XY MIDI")
+  params:add{type="number", id="opxy_device", name="OP-XY Device", min=1, max=16, default=2, action=function(v) opxy_out = midi.connect(v) end}
+  params:add{type="number", id="opxy_channel", name="OP-XY Channel", min=1, max=16, default=1}
+  opxy_out = midi.connect(params:get("opxy_device"))
+
   -- Norns reverb
   audio.rev_on()
   audio.level_rev_dac(0)
@@ -864,5 +883,6 @@ function cleanup()
       midi_out:cc(123, 0, ch)
     end
   end
+  if opxy_out then for ch=1,16 do opxy_out:cc(123,0,ch) end end
   if clk_id then clock.cancel(clk_id) end
 end
