@@ -14,6 +14,10 @@
 -- K3 long:  randomise pattern + all params
 -- K2+K3: randomise selected param
 -- grid (optional): toggle steps (rows 1-4 = kick/snare/hat/open)
+--
+-- PARAMS MENU: per-voice Supertonic synthesis controls
+--   each voice has oscFreq, oscDcy, mix, distAmt, level,
+--   modAmt, nFilFrq, nEnvDcy + a RANDOMIZE trigger
 
 engine.name = 'Supertonic'
 
@@ -28,30 +32,31 @@ local voice_colors = { 15, 10, 6, 4 }
 --------------------------------------------------------------------------------
 -- SUPERTONIC PATCH DEFINITIONS
 -- Each voice gets a base synthesis patch; drumkid params morph these in realtime
+-- These are the DEFAULTS -- params menu overrides them
 --------------------------------------------------------------------------------
 
-local base_patches = {
-  -- KICK: sine osc, pitch-drop mod, low mix (osc-heavy), punchy
+local default_patches = {
+  -- KICK: sine osc, pitch-drop mod, low mix (osc-heavy), punchy, LOUD
   {
-    distAmt = 4, eQFreq = 200, eQGain = 0, level = -3, mix = 12,
-    modAmt = 24, modMode = 0, modRate = 300,
-    nEnvAtk = 0, nEnvDcy = 60, nEnvMod = 0,
-    nFilFrq = 400, nFilMod = 0, nFilQ = 1.5, nStereo = 0,
-    oscAtk = 0, oscDcy = 450, oscFreq = 52, oscWave = 0,
+    distAmt = 8, eQFreq = 120, eQGain = 6, level = 2, mix = 8,
+    modAmt = 30, modMode = 0, modRate = 280,
+    nEnvAtk = 0, nEnvDcy = 80, nEnvMod = 0,
+    nFilFrq = 300, nFilMod = 0, nFilQ = 1.2, nStereo = 0,
+    oscAtk = 0, oscDcy = 600, oscFreq = 48, oscWave = 0,
     oscVel = 100, nVel = 100, modVel = 100,
   },
   -- SNARE: mid osc + noise, HP noise filter, snappy
   {
-    distAmt = 8, eQFreq = 800, eQGain = -3, level = -5, mix = 55,
-    modAmt = 8, modMode = 0, modRate = 200,
-    nEnvAtk = 0, nEnvDcy = 180, nEnvMod = 0,
-    nFilFrq = 2800, nFilMod = 2, nFilQ = 1.8, nStereo = 1,
-    oscAtk = 0, oscDcy = 120, oscFreq = 185, oscWave = 0,
+    distAmt = 10, eQFreq = 900, eQGain = 0, level = 0, mix = 55,
+    modAmt = 10, modMode = 0, modRate = 220,
+    nEnvAtk = 0, nEnvDcy = 200, nEnvMod = 0,
+    nFilFrq = 3200, nFilMod = 2, nFilQ = 1.6, nStereo = 1,
+    oscAtk = 0, oscDcy = 140, oscFreq = 190, oscWave = 0,
     oscVel = 100, nVel = 100, modVel = 80,
   },
   -- CLOSED HI-HAT: noise-heavy, tight, high filter
   {
-    distAmt = 0, eQFreq = 5000, eQGain = 2, level = -8, mix = 92,
+    distAmt = 0, eQFreq = 5000, eQGain = 3, level = -2, mix = 92,
     modAmt = 0, modMode = 2, modRate = 7000,
     nEnvAtk = 0, nEnvDcy = 55, nEnvMod = 0,
     nFilFrq = 7500, nFilMod = 2, nFilQ = 2.2, nStereo = 1,
@@ -60,7 +65,7 @@ local base_patches = {
   },
   -- OPEN HI-HAT: noise-heavy, longer tail, band-pass
   {
-    distAmt = 0, eQFreq = 4500, eQGain = 1, level = -9, mix = 88,
+    distAmt = 0, eQFreq = 4500, eQGain = 2, level = -3, mix = 88,
     modAmt = 0, modMode = 2, modRate = 6000,
     nEnvAtk = 2, nEnvDcy = 350, nEnvMod = 0,
     nFilFrq = 5800, nFilMod = 1, nFilQ = 2.0, nStereo = 1,
@@ -69,8 +74,83 @@ local base_patches = {
   },
 }
 
+-- Live patches (will be populated from params in init)
+local patches = {}
+
 --------------------------------------------------------------------------------
--- DRUMKID PARAMETERS (aleatoric controls)
+-- VOICE PARAM DEFINITIONS
+-- These appear in the norns params menu for per-voice tweaking
+--------------------------------------------------------------------------------
+
+local voice_param_defs = {
+  { id = "oscFreq",  name = "osc freq",     min = 20,   max = 12000, default_key = "oscFreq",  fmt = "Hz" },
+  { id = "oscDcy",   name = "osc decay",    min = 5,    max = 2000,  default_key = "oscDcy",   fmt = "ms" },
+  { id = "oscWave",  name = "osc wave",     min = 0,    max = 2,     default_key = "oscWave",  fmt = "",   options = {"sine", "tri", "saw"} },
+  { id = "mix",      name = "osc/noise",    min = 0,    max = 100,   default_key = "mix",      fmt = "%" },
+  { id = "distAmt",  name = "distortion",   min = 0,    max = 100,   default_key = "distAmt",  fmt = "" },
+  { id = "level",    name = "level",        min = -20,  max = 12,    default_key = "level",    fmt = "dB" },
+  { id = "modAmt",   name = "pitch mod",    min = 0,    max = 60,    default_key = "modAmt",   fmt = "" },
+  { id = "modMode",  name = "mod mode",     min = 0,    max = 2,     default_key = "modMode",  fmt = "",   options = {"decay", "sine", "noise"} },
+  { id = "modRate",  name = "mod rate",     min = 1,    max = 12000, default_key = "modRate",  fmt = "Hz" },
+  { id = "nFilFrq",  name = "noise freq",   min = 20,   max = 16000, default_key = "nFilFrq",  fmt = "Hz" },
+  { id = "nFilMod",  name = "noise filt",   min = 0,    max = 2,     default_key = "nFilMod",  fmt = "",   options = {"LP", "BP", "HP"} },
+  { id = "nFilQ",    name = "noise Q",      min = 0.1,  max = 10,    default_key = "nFilQ",    fmt = "" },
+  { id = "nEnvDcy",  name = "noise decay",  min = 5,    max = 2000,  default_key = "nEnvDcy",  fmt = "ms" },
+  { id = "nEnvMod",  name = "noise env",    min = 0,    max = 2,     default_key = "nEnvMod",  fmt = "",   options = {"exp", "lin", "clap"} },
+  { id = "nStereo",  name = "stereo",       min = 0,    max = 1,     default_key = "nStereo",  fmt = "",   options = {"off", "on"} },
+  { id = "eQFreq",   name = "EQ freq",      min = 20,   max = 16000, default_key = "eQFreq",   fmt = "Hz" },
+  { id = "eQGain",   name = "EQ gain",      min = -20,  max = 20,    default_key = "eQGain",   fmt = "dB" },
+}
+
+-- Build a param id for a given voice + param
+local function vpid(v, pid)
+  return voice_names[v] .. "_" .. pid
+end
+
+-- Read the current patch for a voice from params
+local function read_patch(v)
+  local p = {}
+  for _, def in ipairs(voice_param_defs) do
+    p[def.id] = params:get(vpid(v, def.id))
+  end
+  -- Fixed params not exposed in menu (keep from defaults)
+  p.oscAtk  = default_patches[v].oscAtk
+  p.nEnvAtk = default_patches[v].nEnvAtk
+  p.oscVel  = default_patches[v].oscVel
+  p.nVel    = default_patches[v].nVel
+  p.modVel  = default_patches[v].modVel
+  return p
+end
+
+-- Randomize a single voice's patch with musically sensible ranges
+local function randomise_voice_patch(v)
+  local bp = default_patches[v]
+  for _, def in ipairs(voice_param_defs) do
+    local lo, hi = def.min, def.max
+    -- Keep randomisation musically useful (don't go fully wild)
+    local base = bp[def.default_key] or 0
+    local spread = (hi - lo) * 0.4
+    local new_val = base + (math.random() * 2 - 1) * spread
+    new_val = util.clamp(new_val, lo, hi)
+    -- Integer params
+    if def.options then
+      new_val = math.floor(new_val + 0.5)
+      new_val = util.clamp(new_val, lo, hi)
+    end
+    params:set(vpid(v, def.id), new_val)
+  end
+end
+
+-- Reset a voice to its default patch
+local function reset_voice_patch(v)
+  local bp = default_patches[v]
+  for _, def in ipairs(voice_param_defs) do
+    params:set(vpid(v, def.id), bp[def.default_key] or 0)
+  end
+end
+
+--------------------------------------------------------------------------------
+-- DRUMKID PARAMETERS (aleatoric controls shown on screen)
 --------------------------------------------------------------------------------
 
 local all_params = {
@@ -183,7 +263,7 @@ end
 
 --------------------------------------------------------------------------------
 -- SUPERTONIC TRIGGER
--- Maps drumkid params onto the base patch, then fires the engine
+-- Reads live patch from params, applies drumkid modifiers, fires engine
 --------------------------------------------------------------------------------
 
 local function trigger(v, amp)
@@ -198,34 +278,30 @@ local function trigger(v, amp)
     amp = util.clamp(amp + variation, 0.05, 1.0)
   end
 
-  -- Grab base patch and copy it
-  local bp = base_patches[v]
-  local p = {}
-  for k, val in pairs(bp) do p[k] = val end
+  -- Read current patch from params
+  local p = read_patch(v)
 
-  -- PITCH: 0.5 = base freq, 0 = half, 1 = triple
-  local pitch_mult = 0.5 + p_vals.pitch * 2.5
-  p.oscFreq = bp.oscFreq * pitch_mult
+  -- PITCH: 0.5 = base freq, 0 = half, 1 = double
+  local pitch_mult = 0.5 + p_vals.pitch * 1.5
+  p.oscFreq = p.oscFreq * pitch_mult
 
-  -- CRUSH -> distortion amount (1.0 = clean/2, 0 = heavy/80)
-  p.distAmt = bp.distAmt + (1.0 - p_vals.crush) * 76
+  -- CRUSH -> distortion boost (1.0 = no extra, 0 = heavy)
+  p.distAmt = p.distAmt + (1.0 - p_vals.crush) * 60
 
   -- CROP -> envelope decay scaling (1.0 = full, 0 = super short)
   local crop_scale = math.max(0.05, p_vals.crop)
-  p.oscDcy  = bp.oscDcy  * crop_scale
-  p.nEnvDcy = bp.nEnvDcy * crop_scale
+  p.oscDcy  = p.oscDcy  * crop_scale
+  p.nEnvDcy = p.nEnvDcy * crop_scale
 
   -- WARMTH -> global low-pass filter (0 = wide open, 1 = dark)
   local lpf_freq = 20000 * (1.0 - p_vals.warmth * 0.97)
   local lpf_rq   = 1.0 - p_vals.warmth * 0.4
 
-  -- LEVEL: combine base level with amplitude
-  -- amp 1.0 = base level, scale down from there
-  local level_offset = (1.0 - amp) * -12   -- quieter hits lose up to 12 dB
-  p.level = bp.level + level_offset
+  -- LEVEL: combine patch level with amplitude
+  local level_offset = (1.0 - amp) * -12
+  p.level = p.level + level_offset
 
   -- REVERB (norns built-in)
-  audio.rev_on()
   audio.level_rev_dac(p_vals.reverb * 1.2)
 
   -- Fire the engine!
@@ -512,14 +588,88 @@ end
 -- INIT / CLEANUP
 --------------------------------------------------------------------------------
 
+local function build_params()
+  -- Per-voice Supertonic synthesis params
+  for v = 1, VOICES do
+    params:add_separator(voice_names[v] .. " synth")
+    local bp = default_patches[v]
+
+    for _, def in ipairs(voice_param_defs) do
+      local pid = vpid(v, def.id)
+      local default_val = bp[def.default_key] or 0
+
+      if def.options then
+        -- Option param (oscWave, modMode, nFilMod, nEnvMod, nStereo)
+        params:add_option(pid, def.name, def.options, default_val + 1)
+        -- Store as 0-indexed for engine
+        params:set_action(pid, function(val) end)
+      else
+        local cs = controlspec.new(def.min, def.max, 'lin', 0, default_val, def.fmt)
+        params:add_control(pid, def.name, cs)
+      end
+    end
+
+    -- Randomize trigger for this voice
+    params:add_trigger(vpid(v, "randomize"), ">> RANDOMIZE " .. voice_names[v])
+    params:set_action(vpid(v, "randomize"), function()
+      randomise_voice_patch(v)
+    end)
+
+    -- Reset trigger
+    params:add_trigger(vpid(v, "reset"), ">> RESET " .. voice_names[v])
+    params:set_action(vpid(v, "reset"), function()
+      reset_voice_patch(v)
+    end)
+  end
+
+  -- Global controls
+  params:add_separator("global")
+  params:add_trigger("randomize_all_voices", ">> RANDOMIZE ALL VOICES")
+  params:set_action("randomize_all_voices", function()
+    for v = 1, VOICES do randomise_voice_patch(v) end
+  end)
+  params:add_trigger("reset_all_voices", ">> RESET ALL VOICES")
+  params:set_action("reset_all_voices", function()
+    for v = 1, VOICES do reset_voice_patch(v) end
+  end)
+end
+
+-- Override read_patch to handle option params (0-indexed for engine)
+local orig_read_patch = read_patch
+read_patch = function(v)
+  local p = {}
+  for _, def in ipairs(voice_param_defs) do
+    if def.options then
+      -- Option params are 1-indexed in norns, engine expects 0-indexed
+      p[def.id] = params:get(vpid(v, def.id)) - 1
+    else
+      p[def.id] = params:get(vpid(v, def.id))
+    end
+  end
+  -- Fixed params not exposed in menu
+  p.oscAtk  = default_patches[v].oscAtk
+  p.nEnvAtk = default_patches[v].nEnvAtk
+  p.oscVel  = default_patches[v].oscVel
+  p.nVel    = default_patches[v].nVel
+  p.modVel  = default_patches[v].modVel
+  return p
+end
+
 function init()
   math.randomseed(os.time())
+
+  -- Build norns params for voice tweaking
+  build_params()
+
   default_pattern()
   set_bpm(bpm)
   midi_out = midi.connect(1)
+
   -- Norns reverb
   audio.rev_on()
   audio.level_rev_dac(0)
+
+  -- Start the clock
   clk_id = clock.run(clock_loop)
   redraw(); grid_redraw()
 end
