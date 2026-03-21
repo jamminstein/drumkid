@@ -7,13 +7,21 @@
 -- (uses its Engine_Supertonic — no local copy needed)
 --
 -- E1: tempo (BPM)
--- E2: browse parameters
--- E3: adjust selected parameter
+-- E2: browse parameters (or history when in history mode)
+-- E3: adjust selected parameter (or scroll history when in history mode)
 -- K2: play / stop (release to confirm)
 -- K3 short: randomise pattern
 -- K3 long:  randomise pattern + all params
 -- K2+K3: randomise selected param
+-- KEY2 (in history): load selected randomization
+-- KEY3 (in history): return to live mode
 -- grid (optional): toggle steps (rows 1-4 = kick/snare/hat/open)
+--
+-- HISTORY BROWSER:
+-- E2 in history: scroll through 50 saved randomizations
+-- E3 in history: adjust details / preview volume
+-- K2 in history: load the selected randomization state
+-- K3 in history: return to live mode
 --
 -- PARAMS MENU: per-voice Supertonic synthesis controls
 --   each voice has oscFreq, oscDcy, mix, distAmt, level,
@@ -111,9 +119,14 @@ end
 local function read_patch(v)
   local p = {}
   for _, def in ipairs(voice_param_defs) do
-    p[def.id] = params:get(vpid(v, def.id))
+    if def.options then
+      -- Option params are 1-indexed in norns, engine expects 0-indexed
+      p[def.id] = params:get(vpid(v, def.id)) - 1
+    else
+      p[def.id] = params:get(vpid(v, def.id))
+    end
   end
-  -- Fixed params not exposed in menu (keep from defaults)
+  -- Fixed params not exposed in menu
   p.oscAtk  = default_patches[v].oscAtk
   p.nEnvAtk = default_patches[v].nEnvAtk
   p.oscVel  = default_patches[v].oscVel
@@ -146,6 +159,18 @@ local function reset_voice_patch(v)
   local bp = default_patches[v]
   for _, def in ipairs(voice_param_defs) do
     params:set(vpid(v, def.id), bp[def.default_key] or 0)
+  end
+end
+
+-- Apply a stored patch to a voice (for history recall)
+local function apply_patch(v, p)
+  for _, def in ipairs(voice_param_defs) do
+    if def.options then
+      -- Option params are 1-indexed in norns, stored as 0-indexed
+      params:set(vpid(v, def.id), p[def.id] + 1)
+    else
+      params:set(vpid(v, def.id), p[def.id])
+    end
   end
 end
 
@@ -202,6 +227,100 @@ local pattern = {}
 for v = 1, VOICES do
   pattern[v] = {}
   for s = 1, STEPS do pattern[v][s] = false end
+end
+
+--------------------------------------------------------------------------------
+-- HISTORY SYSTEM
+-- Stores the last 50 randomization snapshots
+--------------------------------------------------------------------------------
+
+local history = {}
+local history_max = 50
+local history_write_idx = 0  -- circular write position
+local history_count = 0      -- actual number of entries
+local browsing_history = false
+local history_browse_idx = 1  -- which entry we're currently viewing (1-indexed)
+
+-- Create a deep copy of all current state for the history snapshot
+local function create_snapshot()
+  local snapshot = {}
+  
+  -- Copy pattern
+  snapshot.pattern = {}
+  for v = 1, VOICES do
+    snapshot.pattern[v] = {}
+    for s = 1, STEPS do
+      snapshot.pattern[v][s] = pattern[v][s]
+    end
+  end
+  
+  -- Copy p_vals
+  snapshot.p_vals = {}
+  for k, v in pairs(p_vals) do
+    snapshot.p_vals[k] = v
+  end
+  
+  -- Copy probability table
+  snapshot.probability = {}
+  for v = 1, VOICES do
+    snapshot.probability[v] = {}
+    for s = 1, STEPS do
+      snapshot.probability[v][s] = probability[v][s]
+    end
+  end
+  
+  -- Copy all voice patches
+  snapshot.patches = {}
+  for v = 1, VOICES do
+    snapshot.patches[v] = read_patch(v)
+  end
+  
+  return snapshot
+end
+
+-- Save the current state to history buffer (circular)
+local function save_to_history()
+  history_write_idx = (history_write_idx % history_max) + 1
+  history[history_write_idx] = create_snapshot()
+  if history_count < history_max then
+    history_count = history_count + 1
+  end
+end
+
+-- Load a snapshot from history by circular index (1 to history_count)
+local function load_from_history(idx)
+  if idx < 1 or idx > history_count then return end
+  
+  -- Map 1-based index to circular buffer position
+  local oldest_idx = history_count < history_max and 1 or (history_write_idx % history_max) + 1
+  local circular_idx = ((oldest_idx - 1 + (idx - 1)) % history_max) + 1
+  
+  local snapshot = history[circular_idx]
+  if not snapshot then return end
+  
+  -- Restore pattern
+  for v = 1, VOICES do
+    for s = 1, STEPS do
+      pattern[v][s] = snapshot.pattern[v][s]
+    end
+  end
+  
+  -- Restore p_vals
+  for k, v in pairs(snapshot.p_vals) do
+    p_vals[k] = v
+  end
+  
+  -- Restore probability
+  for v = 1, VOICES do
+    for s = 1, STEPS do
+      probability[v][s] = snapshot.probability[v][s]
+    end
+  end
+  
+  -- Restore patches
+  for v = 1, VOICES do
+    apply_patch(v, snapshot.patches[v])
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -472,33 +591,52 @@ function key(n, z)
   if n == 2 then
     if z == 1 then
       k2_down = true
-      k2_hold_id = clock.run(function() clock.sleep(K3_LONG); k2_hold_id = nil end)
+      if browsing_history then
+        -- In history mode: K2 loads the selected randomization
+        load_from_history(history_browse_idx)
+        browsing_history = false
+        redraw()
+      else
+        -- Normal mode: K2 play/stop
+        k2_hold_id = clock.run(function() clock.sleep(K3_LONG); k2_hold_id = nil end)
+      end
     else
       k2_down = false
       if k2_hold_id then
         clock.cancel(k2_hold_id); k2_hold_id = nil
-        playing = not playing
-        if playing then step = 1 end
-        redraw()
+        if not browsing_history then
+          playing = not playing
+          if playing then step = 1 end
+          redraw()
+        end
       end
     end
   elseif n == 3 then
     if z == 1 then
-      if k2_down then
+      if browsing_history then
+        -- In history mode: K3 returns to live
+        browsing_history = false
+        redraw()
+      elseif k2_down then
         if k2_hold_id then clock.cancel(k2_hold_id); k2_hold_id = nil end
-        randomise_single(all_params[param_idx]); redraw()
+        randomise_single(all_params[param_idx])
+        save_to_history()
+        redraw()
       else
         k3_hold_id = clock.run(function()
           clock.sleep(K3_LONG)
           randomise_params(); randomise_pattern()
+          save_to_history()
           k3_hold_id = nil; redraw(); grid_redraw()
         end)
       end
     else
       if k3_hold_id then
         clock.cancel(k3_hold_id); k3_hold_id = nil
-        randomise_pattern(); redraw(); grid_redraw()
-      else
+        randomise_pattern()
+        save_to_history()
+        redraw(); grid_redraw()
+      elseif not browsing_history then
         fill_active  = true
         fill_counter = 4
         redraw()
@@ -511,13 +649,25 @@ function enc(n, d)
   if n == 1 then
     set_bpm(bpm + d)
   elseif n == 2 then
-    param_idx = util.clamp(param_idx + d, 1, #all_params)
-  elseif n == 3 then
-    local k = all_params[param_idx]
-    if k == "midi_ch_k" or k == "midi_ch_s" or k == "midi_ch_h" then
-      p_vals[k] = util.clamp(p_vals[k] + d, 1, 16)
+    if browsing_history then
+      -- E2 in history: scroll through history
+      history_browse_idx = util.clamp(history_browse_idx + d, 1, history_count)
     else
-      p_vals[k] = util.clamp(p_vals[k] + d * 0.01, 0.0, 1.0)
+      -- E2 normal: browse parameters
+      param_idx = util.clamp(param_idx + d, 1, #all_params)
+    end
+  elseif n == 3 then
+    if browsing_history then
+      -- E3 in history: could add preview volume control or details
+      -- For now, just allow returning to live
+    else
+      -- E3 normal: adjust selected parameter
+      local k = all_params[param_idx]
+      if k == "midi_ch_k" or k == "midi_ch_s" or k == "midi_ch_h" then
+        p_vals[k] = util.clamp(p_vals[k] + d, 1, 16)
+      else
+        p_vals[k] = util.clamp(p_vals[k] + d * 0.01, 0.0, 1.0)
+      end
     end
   end
   redraw()
@@ -530,57 +680,111 @@ end
 function redraw()
   screen.clear()
   screen.level(15); screen.font_size(8)
-  screen.move(2, 8); screen.text("drumkid")
-  screen.level(playing and 15 or 4)
-  local fill_indicator = fill_active and " FILL" or ""
-  screen.move(58, 8); screen.text((playing and ">" or "|") .. " " .. bpm .. " bpm" .. fill_indicator)
-
-  local gx, gy = 2, 14
-  local sw, sh  = 7, 5
-  for v = 1, VOICES do
-    for s = 1, STEPS do
-      local x = gx + (s - 1) * (sw + 1)
-      local y = gy + (v - 1) * (sh + 2)
-      if s == step and playing then
-        screen.level(15); screen.rect(x, y, sw, sh); screen.fill()
-      elseif pattern[v][s] then
-        screen.level(voice_colors[v]); screen.rect(x, y, sw, sh); screen.fill()
-      else
-        screen.level(2); screen.rect(x, y, sw, sh); screen.stroke()
+  
+  if browsing_history then
+    -- HISTORY BROWSER PAGE
+    screen.move(2, 8); screen.text("HISTORY")
+    screen.level(12)
+    screen.move(58, 8); screen.text(string.format("%d/%d", history_browse_idx, history_count))
+    
+    if history_count == 0 then
+      screen.level(5)
+      screen.move(2, 30); screen.text("(no history yet)")
+    else
+      -- Show the selected snapshot's pattern
+      local gx, gy = 2, 14
+      local sw, sh  = 7, 5
+      local snapshot = nil
+      
+      -- Map 1-based index to circular buffer
+      local oldest_idx = history_count < history_max and 1 or (history_write_idx % history_max) + 1
+      local circular_idx = ((oldest_idx - 1 + (history_browse_idx - 1)) % history_max) + 1
+      snapshot = history[circular_idx]
+      
+      if snapshot then
+        for v = 1, VOICES do
+          for s = 1, STEPS do
+            local x = gx + (s - 1) * (sw + 1)
+            local y = gy + (v - 1) * (sh + 2)
+            if snapshot.pattern[v][s] then
+              screen.level(voice_colors[v]); screen.rect(x, y, sw, sh); screen.fill()
+            else
+              screen.level(2); screen.rect(x, y, sw, sh); screen.stroke()
+            end
+          end
+          screen.level(voice_colors[v])
+          screen.move(gx + STEPS * (sw + 1) + 1, gy + (v - 1) * (sh + 2) + sh)
+          screen.text(voice_names[v])
+        end
+        
+        -- Show some key params from this snapshot
+        screen.level(5)
+        screen.move(2, 50); screen.text("pitch: " .. string.format("%.2f", snapshot.p_vals.pitch))
+        screen.move(35, 50); screen.text("crush: " .. string.format("%.2f", snapshot.p_vals.crush))
+        screen.move(2, 58); screen.text("K2:load K3:live")
       end
     end
-    screen.level(voice_colors[v])
-    screen.move(gx + STEPS * (sw + 1) + 1, gy + (v - 1) * (sh + 2) + sh)
-    screen.text(voice_names[v])
-  end
+  else
+    -- NORMAL LIVE PAGE
+    screen.move(2, 8); screen.text("drumkid")
+    screen.level(playing and 15 or 4)
+    local fill_indicator = fill_active and " FILL" or ""
+    screen.move(58, 8); screen.text((playing and ">" or "|") .. " " .. bpm .. " bpm" .. fill_indicator)
 
-  local py    = 50
-  local page  = math.floor((param_idx - 1) / 4)
-  local start_i = page * 4 + 1
-  local n_pages = math.ceil(#all_params / 4)
-  for i = start_i, math.min(start_i + 3, #all_params) do
-    local k   = all_params[i]
-    local val = p_vals[k]
-    local sel = (i == param_idx)
-    local col = (i - start_i)
-    local x   = 2 + col * 31
-    screen.level(sel and 15 or 5); screen.move(x, py); screen.text(k:sub(1, 4))
-    if k == "midi_ch_k" or k == "midi_ch_s" or k == "midi_ch_h" then
-      local bar_width = math.floor((val / 16) * 28)
-      screen.level(sel and 12 or 3); screen.rect(x, py + 3, bar_width, 3); screen.fill()
-      if sel then screen.level(6); screen.move(x, py + 13); screen.text(string.format("%d", val)) end
-    else
-      screen.level(sel and 12 or 3); screen.rect(x, py + 3, math.floor(val * 28), 3); screen.fill()
-      if sel then screen.level(6); screen.move(x, py + 13); screen.text(string.format("%.2f", val)) end
+    local gx, gy = 2, 14
+    local sw, sh  = 7, 5
+    for v = 1, VOICES do
+      for s = 1, STEPS do
+        local x = gx + (s - 1) * (sw + 1)
+        local y = gy + (v - 1) * (sh + 2)
+        if s == step and playing then
+          screen.level(15); screen.rect(x, y, sw, sh); screen.fill()
+        elseif pattern[v][s] then
+          screen.level(voice_colors[v]); screen.rect(x, y, sw, sh); screen.fill()
+        else
+          screen.level(2); screen.rect(x, y, sw, sh); screen.stroke()
+        end
+      end
+      screen.level(voice_colors[v])
+      screen.move(gx + STEPS * (sw + 1) + 1, gy + (v - 1) * (sh + 2) + sh)
+      screen.text(voice_names[v])
     end
-    screen.level(sel and 5 or 2); screen.rect(x, py + 3, 28, 3); screen.stroke()
-  end
 
-  for p = 0, n_pages - 1 do
-    screen.level(p == page and 12 or 4); screen.rect(116 + p * 6, py, 4, 4); screen.fill()
-  end
+    local py    = 50
+    local page  = math.floor((param_idx - 1) / 4)
+    local start_i = page * 4 + 1
+    local n_pages = math.ceil(#all_params / 4)
+    for i = start_i, math.min(start_i + 3, #all_params) do
+      local k   = all_params[i]
+      local val = p_vals[k]
+      local sel = (i == param_idx)
+      local col = (i - start_i)
+      local x   = 2 + col * 31
+      screen.level(sel and 15 or 5); screen.move(x, py); screen.text(k:sub(1, 4))
+      if k == "midi_ch_k" or k == "midi_ch_s" or k == "midi_ch_h" then
+        local bar_width = math.floor((val / 16) * 28)
+        screen.level(sel and 12 or 3); screen.rect(x, py + 3, bar_width, 3); screen.fill()
+        if sel then screen.level(6); screen.move(x, py + 13); screen.text(string.format("%d", val)) end
+      else
+        screen.level(sel and 12 or 3); screen.rect(x, py + 3, math.floor(val * 28), 3); screen.fill()
+        if sel then screen.level(6); screen.move(x, py + 13); screen.text(string.format("%.2f", val)) end
+      end
+      screen.level(sel and 5 or 2); screen.rect(x, py + 3, 28, 3); screen.stroke()
+    end
 
-  screen.level(3); screen.move(2, 64); screen.text("e3:adj k3:pat/fill k2+k3:rnd")
+    for p = 0, n_pages - 1 do
+      screen.level(p == page and 12 or 4); screen.rect(116 + p * 6, py, 4, 4); screen.fill()
+    end
+
+    -- History browser button indicator
+    screen.level(history_count > 0 and 8 or 3)
+    screen.move(2, 64); screen.text("e2:hist e3:adj k3:pat/fill")
+    if history_count > 0 then
+      screen.level(8)
+      screen.move(110, 64); screen.text("[" .. history_count .. "]")
+    end
+  end
+  
   screen.update()
 end
 
@@ -632,27 +836,6 @@ local function build_params()
   params:set_action("reset_all_voices", function()
     for v = 1, VOICES do reset_voice_patch(v) end
   end)
-end
-
--- Override read_patch to handle option params (0-indexed for engine)
-local orig_read_patch = read_patch
-read_patch = function(v)
-  local p = {}
-  for _, def in ipairs(voice_param_defs) do
-    if def.options then
-      -- Option params are 1-indexed in norns, engine expects 0-indexed
-      p[def.id] = params:get(vpid(v, def.id)) - 1
-    else
-      p[def.id] = params:get(vpid(v, def.id))
-    end
-  end
-  -- Fixed params not exposed in menu
-  p.oscAtk  = default_patches[v].oscAtk
-  p.nEnvAtk = default_patches[v].nEnvAtk
-  p.oscVel  = default_patches[v].oscVel
-  p.nVel    = default_patches[v].nVel
-  p.modVel  = default_patches[v].modVel
-  return p
 end
 
 function init()
